@@ -33,4 +33,4 @@ jobs:
           git diff --staged --quiet || git commit -m "state update"
           git push
 
-5. Green "Commit changes" button (top right) → Commit
+4. Commit changes → Commit to main
