@@ -1,0 +1,36 @@
+name: trading-bot
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes, forever
+  workflow_dispatch:          # manual run button too
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install python-binance pandas python-dotenv requests
+
+      - name: Run one cycle
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python bot_engine_v5.py --once
+
+      - name: Commit state back
+        run: |
+          git config user.name "bot-runner"
+          git config user.email "bot@github.com"
+          git add bot_state.json equity_log.csv trades_log_*.csv 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "state update $(date -u +%H:%M)"
+          git push
