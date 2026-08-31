@@ -33,4 +33,8 @@ jobs:
           git diff --staged --quiet || git commit -m "state update"
           git push
 
-4. Commit changes → Commit to main
+5. VERIFY before committing:
+   → Line 1 = "name: trading-bot"  ✅
+   → LAST line = "          git push"  ✅
+   → NO numbered instructions anywhere (no "1." "4." "5.")
+6. Commit changes → Commit directly to main → Commit changes
