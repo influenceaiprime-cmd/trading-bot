@@ -4,4 +4,3 @@ bot_state.json
 equity_log.csv
 trades_log_*.csv
 __pycache__/
-.github/
