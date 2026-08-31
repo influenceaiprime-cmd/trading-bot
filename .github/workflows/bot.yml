@@ -18,6 +18,9 @@ jobs:
       - name: Install deps
         run: pip install python-binance pandas python-dotenv requests
 
+      - name: Debug listing
+        run: ls -la *.py
+
       - name: Run one cycle
         env:
           API_KEY: ${{ secrets.API_KEY }}
