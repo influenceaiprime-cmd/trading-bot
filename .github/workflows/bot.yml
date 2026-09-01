@@ -1,37 +1,68 @@
-name: trading-bot
+name: Trading Bot Cycle
+
+# Runs the engine once every 15 minutes without needing your laptop on at
+# all. Each run is a fresh, disposable container - it checks out the repo
+# (which includes the last committed bot_state.json), runs ONE cycle
+# (--once), then commits back whatever changed (state, equity log, trade
+# logs) so the NEXT run picks up where this one left off.
+#
+# REQUIRED SETUP before this will work:
+#   1. In your GitHub repo: Settings -> Secrets and variables -> Actions
+#      -> New repository secret. Add these (names must match exactly):
+#        BINANCE_API_KEY
+#        BINANCE_API_SECRET
+#        DISCORD_WEBHOOK       (optional - omit if you don't use it)
+#        TELEGRAM_TOKEN        (optional)
+#        TELEGRAM_CHAT_ID      (optional)
+#   2. Settings -> Actions -> General -> Workflow permissions -> set to
+#      "Read and write permissions", so the workflow can commit state
+#      files back to the repo.
+#   3. bot_state.json, equity_log.csv, and trades_log_*.csv must NOT be in
+#      .gitignore (see the updated .gitignore in this same commit) -
+#      otherwise state can't persist between runs.
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch:
+    - cron: "*/15 * * * *"   # every 15 minutes. GitHub may delay this under load - don't rely on exact timing.
+  workflow_dispatch: {}       # lets you trigger a run manually from the Actions tab, useful for testing
+
+permissions:
+  contents: write            # required so the workflow can commit state files back
 
 jobs:
-  run:
+  run-bot-cycle:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install deps
-        run: pip install python-binance pandas python-dotenv requests
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Debug listing
-        run: ls -la *.py
+      - name: Write .env from GitHub secrets
+        run: |
+          cat > .env << EOF
+          BINANCE_API_KEY=${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET=${{ secrets.BINANCE_API_SECRET }}
+          DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}
+          TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          EOF
 
-      - name: Run one cycle
-        env:
-          API_KEY: ${{ secrets.API_KEY }}
-          API_SECRET: ${{ secrets.API_SECRET }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: Run one bot cycle
         run: python bot_engine_v5.py --once
 
-      - name: Commit state back
+      - name: Commit updated state back to the repo
         run: |
-          git config user.name "bot-runner"
-          git config user.email "bot@github.com"
-          git add bot_state.json || true
-          git diff --staged --quiet || git commit -m "state update"
+          git config user.name "trading-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add bot_state.json equity_log.csv trades_log_*.csv engine.log 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "bot: update state [skip ci]"
           git push
