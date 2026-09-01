@@ -1,0 +1,56 @@
+PROPRIETARY SOFTWARE LICENSE (TEMPLATE - HAVE A LAWYER REVIEW BEFORE USE)
+
+Copyright (c) [YEAR] [YOUR NAME / BUSINESS NAME]. All rights reserved.
+
+This is a starting template, not a finished legal document. Before you sell,
+license, or distribute this software to anyone, have a lawyer familiar with
+your jurisdiction and with fintech/algorithmic-trading software review and
+finalize these terms. Trading software carries liability considerations
+that a generic template cannot fully cover.
+
+1. GRANT OF LICENSE
+   Subject to payment of applicable fees, [YOUR NAME / BUSINESS NAME] grants
+   the purchaser a non-exclusive, non-transferable license to run this
+   software for their own personal or internal business use. Redistribution,
+   resale, or sublicensing of the source code is prohibited without written
+   permission.
+
+2. NO FINANCIAL ADVICE
+   This software is a tool for automating trade execution based on
+   user-configured rules. It does not constitute financial, investment, or
+   trading advice. The licensor is not a registered investment adviser,
+   broker-dealer, or financial advisor. Any decision to use this software to
+   place trades is made solely by the licensee.
+
+3. NO WARRANTY
+   THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, OR NON-INFRINGEMENT. NO WARRANTY IS
+   MADE REGARDING PROFITABILITY, ACCURACY, OR RELIABILITY OF ANY TRADING
+   SIGNAL OR STRATEGY.
+
+4. LIMITATION OF LIABILITY
+   IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY TRADING LOSSES, LOST
+   PROFITS, OR ANY INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES
+   ARISING FROM THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
+   OF SUCH DAMAGES. THE LICENSEE ASSUMES ALL RISK ASSOCIATED WITH TRADING
+   CRYPTOCURRENCY OR ANY OTHER ASSET USING THIS SOFTWARE.
+
+5. USER RESPONSIBILITY
+   The licensee is solely responsible for: securing their own exchange API
+   keys, configuring risk parameters appropriate to their own risk
+   tolerance, monitoring the software's operation, and complying with all
+   laws and regulations applicable to their use of automated trading tools
+   in their jurisdiction.
+
+6. NO GUARANTEE OF RESULTS
+   Any backtest results, performance figures, or examples provided are
+   based on historical data and simulated assumptions about fees and
+   slippage. They do not represent actual trading and do not guarantee
+   future results.
+
+7. TERMINATION
+   This license may be terminated by the licensor for breach of these
+   terms, including unauthorized redistribution of the source code.
+
+--- END OF TEMPLATE ---

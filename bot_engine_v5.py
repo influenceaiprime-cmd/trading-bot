@@ -1,209 +1,356 @@
 import sys
 """
-BOT ENGINE v5 - LIVE EXECUTION + MEMORY + ALERTS
-v4 + persistent state (survives restarts) + equity log + dashboard + Telegram
+BOT ENGINE v5.2 - LIVE EXECUTION + MEMORY + ALERTS (hardened, shared strategy)
+
+This version now imports its parameters from config.py and its signal logic
+from strategy.py, instead of duplicating both inline. That means:
+  - backtest.py tests the EXACT same entry/exit logic this file trades with
+  - changing a risk parameter means editing config.py once, not hunting
+    through multiple files
+  - the higher-timeframe filter (htf.py) now actually uses a higher
+    timeframe (4h) instead of re-checking the same 1h candles
+
+See CHANGELOG.md for the full history of bug fixes across versions.
 """
-import os, time, json
-from datetime import datetime
+import os
+import csv
+import time
+import json
+import math
+import logging
+import traceback
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, date
+
 import pandas as pd
 import numpy as np
-from dotenv import load_dotenv
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
+
+import config  # config.py loads .env itself - see the fix at its top
 from binance_data import get_klines_df
-
-load_dotenv()
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN")       # optional
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")      # optional
-client = Client(API_KEY, API_SECRET, testnet=True)
-
 from htf import htf_uptrend
-PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-INTERVAL = "1h"
-SL_PCT, TP_PCT, RISK_PCT = 2.0, 4.0, 2.0
-COOLDOWN_MIN = 180
-STATE_FILE = "bot_state.json"
-EQUITY_FILE = "equity_log.csv"
+import strategy_trend as strategy
+
+client = Client(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, testnet=True)
+
+# ---------- LOGGING ----------
+logger = logging.getLogger("bot_engine")
+logger.setLevel(logging.INFO)
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+_file = RotatingFileHandler("engine.log", maxBytes=2_000_000, backupCount=5)
+_file.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+logger.addHandler(_console)
+logger.addHandler(_file)
+
+
+def with_retries(fn, *args, **kwargs):
+    """Call fn(*args, **kwargs), retrying on transient Binance/network errors."""
+    last_err = None
+    for attempt in range(1, config.API_RETRIES + 1):
+        try:
+            return fn(*args, **kwargs)
+        except BinanceAPIException as e:
+            last_err = e
+            if e.code in (-2010, -1121):  # insufficient balance, invalid symbol - won't succeed on retry
+                raise
+            logger.warning(f"API error attempt {attempt}/{config.API_RETRIES}: {e}")
+        except Exception as e:
+            last_err = e
+            logger.warning(f"error attempt {attempt}/{config.API_RETRIES}: {e}")
+        time.sleep(config.API_RETRY_DELAY)
+    raise last_err
+
 
 # ---------- STATE PERSISTENCE ----------
 def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"positions": {}, "cooldowns": {}, "last_prices": {}}
+    if os.path.exists(config.STATE_FILE):
+        with open(config.STATE_FILE) as f:
+            state = json.load(f)
+    else:
+        state = {}
+    state.setdefault("positions", {})
+    state.setdefault("cooldowns", {})
+    state.setdefault("last_prices", {})
+    state.setdefault("daily_start_equity", None)
+    state.setdefault("daily_date", None)
+    return state
+
 
 def save_state():
-    with open(STATE_FILE, "w") as f:
+    with open(config.STATE_FILE, "w") as f:
         json.dump(STATE, f, indent=2)
 
-STATE = load_state()
 
-# ---------- DISCORD ALERTS ----------
+STATE = load_state()
+SYMBOL_FILTERS = {}  # exchange LOT_SIZE / MIN_NOTIONAL per symbol, loaded at startup
+
+
+def load_symbol_filters():
+    for symbol in config.LIVE_PAIRS:
+        try:
+            info = with_retries(client.get_symbol_info, symbol)
+            step_size = min_qty = min_notional = None
+            for f in info["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    step_size = float(f["stepSize"])
+                    min_qty = float(f["minQty"])
+                elif f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
+                    min_notional = float(f.get("minNotional", f.get("notional", 10)))
+            SYMBOL_FILTERS[symbol] = {
+                "step_size": step_size or 0.00001,
+                "min_qty": min_qty or 0.0,
+                "min_notional": min_notional or config.MIN_TRADE_USDT,
+            }
+        except Exception as e:
+            logger.warning(f"couldn't load filters for {symbol}, using defaults: {e}")
+            SYMBOL_FILTERS[symbol] = {
+                "step_size": 0.00001,
+                "min_qty": 0.0,
+                "min_notional": config.MIN_TRADE_USDT,
+            }
+
+
+def round_step(qty, step):
+    if step <= 0:
+        return qty, 8
+    precision = int(round(-math.log10(step)))
+    return math.floor(qty / step) * step, precision
+
+
+def format_qty(symbol, qty):
+    f = SYMBOL_FILTERS.get(symbol, {"step_size": 0.00001, "min_qty": 0.0})
+    stepped, precision = round_step(qty, f["step_size"])
+    if stepped < f["min_qty"]:
+        return 0.0
+    return round(stepped, max(precision, 0))
+
+
+# ---------- ALERTS ----------
 def notify(msg):
-    print(f"  [ALERT] {msg}")
-    hook = os.getenv("DISCORD_WEBHOOK")
-    if hook:
+    logger.info(f"ALERT: {msg}")
+    if config.DISCORD_WEBHOOK:
         try:
             import requests
-            requests.post(hook, json={"content": "🤖 " + msg}, timeout=15)
+            requests.post(config.DISCORD_WEBHOOK, json={"content": "\U0001F916 " + msg}, timeout=15)
         except Exception as e:
-            print(f"  [discord failed: {e}]")
+            logger.warning(f"discord failed: {e}")
+    if config.TELEGRAM_TOKEN and config.TELEGRAM_CHAT_ID:
+        try:
+            import requests
+            url = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": config.TELEGRAM_CHAT_ID, "text": msg}, timeout=15)
+        except Exception as e:
+            logger.warning(f"telegram failed: {e}")
 
-# ---------- INDICATORS ----------
-def rsi(s, n=14):
-    d = s.diff()
-    return 100 - (100 / (1 + d.clip(lower=0).rolling(n).mean() / -d.clip(upper=0).rolling(n).mean()))
-
-def analyze(df):
-    d = df.copy()
-    d['RSI'] = rsi(d['Close'])
-    d['SMA20'] = d['Close'].rolling(20).mean()
-    d['SMA50'] = d['Close'].rolling(50).mean()
-    d['SMA100'] = d['Close'].rolling(100).mean()
-    d['MACD'] = d['Close'].ewm(span=12).mean() - d['Close'].ewm(span=26).mean()
-    d['MACDsig'] = d['MACD'].ewm(span=9).mean()
-    std = d['Close'].rolling(20).std()
-    d['BBlo'] = d['SMA20'] - 2 * std
-    d['BBhi'] = d['SMA20'] + 2 * std
-    hl, hc, lc = d['High']-d['Low'], (d['High']-d['Close'].shift()).abs(), (d['Low']-d['Close'].shift()).abs()
-    d['ATR'] = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(14).mean()
-    return d
 
 def log(symbol, msg):
-    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} | {msg}"
-    print(line)
-    with open(f"trades_log_{symbol.replace('USDT','')}.csv", "a") as f:
-        f.write(line.replace(" | ", ",") + "\n")
+    """Per-symbol structured CSV trade log, readable by journal.py."""
+    ts = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+    logger.info(f"[{symbol}] {msg}")
+    fname = f"trades_log_{symbol.replace('USDT', '')}.csv"
+    new_file = not os.path.exists(fname)
+    with open(fname, "a", newline="") as f:
+        writer = csv.writer(f)
+        if new_file:
+            writer.writerow(["time", "message"])
+        writer.writerow([ts, msg])
+
 
 def get_position(symbol):
-    bal = float(client.get_asset_balance(asset=symbol.replace("USDT", ""))['free'])
-    return bal
+    bal = with_retries(client.get_asset_balance, asset=symbol.replace("USDT", ""))
+    return float(bal['free'])
 
-# ---------- EXITS (with trailing stop) ----------
-TRAIL_ARM, TRAIL_GAP = 4.0, 1.5   # arm at +4%, exit 1.5% below peak
-def check_exit(symbol, price):
+
+def get_usdt_balance():
+    bal = with_retries(client.get_asset_balance, asset="USDT")
+    return float(bal['free'])
+
+
+# ---------- DAILY LOSS CIRCUIT BREAKER ----------
+def check_daily_reset(current_equity):
+    today = date.today().isoformat()
+    if STATE.get("daily_date") != today:
+        STATE["daily_date"] = today
+        STATE["daily_start_equity"] = current_equity
+        save_state()
+
+
+def daily_loss_exceeded(current_equity):
+    start = STATE.get("daily_start_equity")
+    if not start or start <= 0:
+        return False
+    drawdown_pct = (start - current_equity) / start * 100
+    return drawdown_pct >= config.MAX_DAILY_LOSS_PCT
+
+
+# ---------- EXITS ----------
+def check_exit(symbol, price, row):
+    """
+    Trend-following exits: NO fixed take-profit by design (see strategy_trend.py's
+    docstring for why) - only a wide ATR-based trailing stop, a catastrophic
+    hard stop, or the trend itself breaking (close back below SMA50).
+    """
     p = STATE["positions"].get(symbol)
     if not p:
         return
-    entry = p['entry']
-    peak = p.get('peak', entry)
-    if price > peak:
-        peak = price
-        p['peak'] = peak
-        save_state()
-    pnl = (price - entry) / entry * 100
-    trail_price = peak * (1 - TRAIL_GAP/100)
-    armed = (peak/entry - 1) * 100 >= TRAIL_ARM
-    if pnl <= -SL_PCT:
-        qty = get_position(symbol)
-        if qty * price > 5:
-            client.order_market_sell(symbol=symbol, quantity=round(qty, 5))
-            log(symbol, f"SELL(exit) STOP-LOSS {pnl:.2f}% @ {price}")
-            notify(f"🛑 {symbol} STOP-LOSS {pnl:+.2f}% @ ${price:,.2f}")
-        STATE["positions"][symbol] = None
-        STATE["cooldowns"][symbol] = time.time() + COOLDOWN_MIN * 60
-        save_state()
-    elif armed and price <= trail_price:
-        qty = get_position(symbol)
-        if qty * price > 5:
-            client.order_market_sell(symbol=symbol, quantity=round(qty, 5))
-            log(symbol, f"SELL(exit) TRAILED-PROFIT {pnl:.2f}% @ {price} (peak {peak:.2f})")
-            notify(f"✅ {symbol} TAKE-PROFIT {pnl:+.2f}% @ ${price:,.2f}")
-        STATE["positions"][symbol] = None
-        STATE["cooldowns"][symbol] = time.time() + COOLDOWN_MIN * 60
-        save_state()
+
+    should_exit, exit_reason, peak = strategy.check_exit(price, p, symbol=symbol)
+    p['peak'] = peak
+    if not should_exit and price < row['SMA50']:
+        should_exit, exit_reason = True, "TREND-BROKEN"
+
+    save_state()  # persist the updated peak even if we're not exiting yet
+
+    if not should_exit:
+        return
+
+    pnl = (price - p['entry']) / p['entry'] * 100
+    qty = p['qty']
+    real_qty = get_position(symbol)
+    sell_qty = format_qty(symbol, min(qty, real_qty))
+    if sell_qty <= 0:
+        log(symbol, f"EXIT SKIPPED ({exit_reason}) - qty too small or balance mismatch (tracked={qty}, wallet={real_qty})")
+    else:
+        try:
+            with_retries(client.order_market_sell, symbol=symbol, quantity=sell_qty)
+            log(symbol, f"SELL(exit) {exit_reason} {pnl:.2f}% @ {price} (peak {peak:.2f})")
+            emoji = "\U0001F6D1" if exit_reason in ("HARD-STOP", "TRAIL-STOP") and pnl < 0 else "\u2705"
+            notify(f"{emoji} {symbol} {exit_reason} {pnl:+.2f}% @ ${price:,.2f}")
+        except Exception as e:
+            log(symbol, f"EXIT FAILED ({exit_reason}): {e}")
+            return  # don't clear the position if the sell actually failed
+
+    STATE["positions"][symbol] = None
+    STATE["cooldowns"][symbol] = time.time() + config.COOLDOWN_MIN * 60
+    save_state()
+
 
 # ---------- ENTRIES ----------
-def check_entry(symbol, df):
+def check_entry(symbol, df, daily_locked):
+    if daily_locked:
+        return
     if STATE["positions"].get(symbol):
         return
     if time.time() < STATE["cooldowns"].get(symbol, 0):
         return
+    if len([v for v in STATE["positions"].values() if v]) >= config.MAX_OPEN_POSITIONS:
+        return
+
     row, prev = df.iloc[-1], df.iloc[-2]
     price = float(row['Close'])
-    usdt = float(client.get_asset_balance(asset="USDT")['free'])
 
-    if price <= row['SMA100']:   # regime filter
+    ok, reason = strategy.entry_allowed(row, prev, symbol=symbol)
+    if not ok:
         return
-    atr_pct = row['ATR'] / price * 100 if not np.isnan(row['ATR']) else 1.0
-    mult = 1.0 if atr_pct < 0.5 else 0.7 if atr_pct < 1.0 else 0.5 if atr_pct < 2.0 else 0.4
-    score = 0
-    if row['RSI'] < 30: score += 1
-    elif row['RSI'] > 70: score -= 1
-    score += 1 if row['SMA20'] > row['SMA50'] else -1
-    if row['MACD'] > row['MACDsig'] and prev['MACD'] <= prev['MACDsig']: score += 2
-    elif row['MACD'] < row['MACDsig'] and prev['MACD'] >= prev['MACDsig']: score -= 2
-    if price < row['BBlo']: score += 1
-    elif price > row['BBhi']: score -= 1
 
-    reason = f"score={score} RSI={row['RSI']:.1f} MACD={'UP' if row['MACD']>row['MACDsig'] else 'DN'}"
-    if score >= 2 and usdt > 10 and htf_uptrend(client, symbol) and len(STATE["positions"]) < 3:
-        risk_amt = 10000.0 * (RISK_PCT / 100) * mult
-        qty = risk_amt / (price * (SL_PCT / 100))
-        qty = min(qty, (usdt * 0.95) / price)
-        qty = float(f"{qty:.5f}")
-        if qty * price < 10:
-            return
-        try:
-            client.order_market_buy(symbol=symbol, quantity=qty)
-            STATE["positions"][symbol] = {'entry': price, 'qty': qty, 'time': datetime.now().isoformat(), 'peak': price}
-            save_state()
-            log(symbol, f"BUY {qty} @ {price} | {reason} | vol_mult={mult}")
-            notify(f"🟢 BUY {symbol}: {qty} @ ${price:,.2f} | {reason}")
-        except Exception as e:
-            log(symbol, f"BUY FAILED: {e}")
+    usdt = get_usdt_balance()
+    if usdt <= 10:
+        return
+    if not htf_uptrend(client, symbol):
+        return
+
+    atr_pct = row['ATR'] / price * 100 if not np.isnan(row['ATR']) else 1.0
+    qty, mult, stop_pct = strategy.position_size(usdt, price, atr_pct, symbol=symbol)
+    qty = format_qty(symbol, qty)
+
+    min_notional = SYMBOL_FILTERS.get(symbol, {}).get("min_notional", config.MIN_TRADE_USDT)
+    if qty <= 0 or qty * price < min_notional:
+        return
+
+    try:
+        with_retries(client.order_market_buy, symbol=symbol, quantity=qty)
+        atr = row['ATR']
+        STATE["positions"][symbol] = {
+            'entry': price,
+            'qty': qty,
+            'time': datetime.now().isoformat(),
+            'peak': price,
+            'atr_entry': atr,  # used by strategy_trend.check_exit for trail/hard-stop distances
+        }
+        save_state()
+        log(symbol, f"BUY {qty} @ {price} | {reason} | vol_mult={mult} | ATR={atr:.2f}")
+        notify(f"\U0001F7E2 BUY {symbol}: {qty} @ ${price:,.2f} | {reason}")
+    except Exception as e:
+        log(symbol, f"BUY FAILED: {e}")
+
 
 # ---------- EQUITY TRACKING ----------
-def log_equity():
-    usdt = float(client.get_asset_balance(asset="USDT")['free'])
+def compute_equity():
+    usdt = get_usdt_balance()
     crypto_val = 0.0
-    for s in PAIRS:
-        qty = get_position(s)
-        if qty > 0 and s in STATE["last_prices"]:
-            crypto_val += qty * STATE["last_prices"][s]
-    total = usdt + crypto_val
-    new_file = not os.path.exists(EQUITY_FILE)
-    with open(EQUITY_FILE, "a") as f:
+    for s in config.LIVE_PAIRS:
+        pos = STATE["positions"].get(s)
+        if pos and s in STATE["last_prices"]:
+            crypto_val += pos['qty'] * STATE["last_prices"][s]
+    return usdt, crypto_val, usdt + crypto_val
+
+
+def log_equity():
+    usdt, crypto_val, total = compute_equity()
+    new_file = not os.path.exists(config.EQUITY_FILE)
+    with open(config.EQUITY_FILE, "a") as f:
         if new_file:
             f.write("time,usdt,crypto_value,total\n")
         f.write(f"{datetime.now():%Y-%m-%d %H:%M},{usdt:.2f},{crypto_val:.2f},{total:.2f}\n")
     return total
 
-# ---------- MAIN LOOP ----------
-print("="*60)
-print("  BOT ENGINE v5 - LIVE TESTNET + MEMORY + ALERTS")
-print("  State file:", STATE_FILE, "| Ctrl+C to stop")
-print("="*60)
 
-ONE_SHOT = "--once" in sys.argv
-try:
-    while not ONE_SHOT:
-        print(f"\n--- Cycle {datetime.now():%H:%M:%S} ---")
-        for symbol in PAIRS:
-            try:
-                df = get_klines_df(API_KEY, API_SECRET, symbol, INTERVAL, 200)
-                d = analyze(df)
-                price = float(d['Close'].iloc[-1])
-                STATE["last_prices"][symbol] = price
-                pos = STATE["positions"].get(symbol)
-                if pos:
-                    pnl = (price - pos['entry']) / pos['entry'] * 100
-                    status = f"IN pos {pos['qty']} from {pos['entry']:.2f} (pnl {pnl:+.2f}%)"
-                else:
-                    cd_left = int((STATE["cooldowns"].get(symbol, 0) - time.time()) / 60)
-                    status = f"flat" + (f" | cooldown {cd_left}m left" if cd_left > 0 else "")
-                print(f"{symbol}: ${price:,.2f} | {status}")
-                check_exit(symbol, price)
-                check_entry(symbol, d)
-            except Exception as e:
-                print(f"{symbol}: ERROR {e}")
-        save_state()
-        total = log_equity()
-        print(f"TOTAL EQUITY: ${total:,.2f} (logged to {EQUITY_FILE})")
-        time.sleep(300)
-        if ONE_SHOT:
-            break
-except KeyboardInterrupt:
+# ---------- MAIN LOOP ----------
+def run_cycle():
+    _, _, total_equity = compute_equity()
+    check_daily_reset(total_equity)
+    locked = daily_loss_exceeded(total_equity)
+    if locked:
+        logger.warning(f"circuit breaker: daily loss limit hit - no new entries this cycle (equity ${total_equity:,.2f})")
+
+    for symbol in config.LIVE_PAIRS:
+        try:
+            df = get_klines_df(config.BINANCE_API_KEY, config.BINANCE_API_SECRET, symbol, config.INTERVAL, 200)
+            d = strategy.analyze(df)
+            row = d.iloc[-1]
+            price = float(row['Close'])
+            STATE["last_prices"][symbol] = price
+            pos = STATE["positions"].get(symbol)
+            if pos:
+                pnl = (price - pos['entry']) / pos['entry'] * 100
+                status = f"IN pos {pos['qty']} from {pos['entry']:.2f} (pnl {pnl:+.2f}%)"
+            else:
+                cd_left = int((STATE["cooldowns"].get(symbol, 0) - time.time()) / 60)
+                status = "flat" + (f" | cooldown {cd_left}m left" if cd_left > 0 else "")
+            logger.info(f"{symbol}: ${price:,.2f} | {status}")
+            check_exit(symbol, price, row)
+            check_entry(symbol, d, locked)
+        except Exception as e:
+            logger.error(f"{symbol}: ERROR {e}")
+            logger.error(traceback.format_exc())
+
     save_state()
-    print("\nEngine stopped SAFELY - state saved, positions remembered for next run.")
+    total = log_equity()
+    logger.info(f"TOTAL EQUITY: ${total:,.2f} (logged to {config.EQUITY_FILE})")
+
+
+def main():
+    logger.info("=" * 60)
+    logger.info("  BOT ENGINE v5.2 - LIVE TESTNET + MEMORY + ALERTS (hardened)")
+    logger.info(f"  State file: {config.STATE_FILE} | Ctrl+C to stop")
+    logger.info("=" * 60)
+
+    load_symbol_filters()
+    one_shot = "--once" in sys.argv
+
+    try:
+        while True:
+            logger.info(f"--- Cycle {datetime.now():%H:%M:%S} ---")
+            run_cycle()
+            if one_shot:
+                break
+            time.sleep(config.CYCLE_SLEEP_SECONDS)
+    except KeyboardInterrupt:
+        save_state()
+        logger.info("Engine stopped SAFELY - state saved, positions remembered for next run.")
+
+
+if __name__ == "__main__":
+    main()
