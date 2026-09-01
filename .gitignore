@@ -1,6 +1,17 @@
 .env
-bot_state.json
-bot_state.json
-equity_log.csv
-trades_log_*.csv
 __pycache__/
+*.pyc
+engine.log*
+dashboard.html
+equity_chart.png
+backtest_equity_curve.csv
+backtest_trades.csv
+backtest_trend_equity_curve.csv
+backtest_trend_trades.csv
+
+# NOTE: bot_state.json, equity_log.csv, and trades_log_*.csv are intentionally
+# NOT ignored. The GitHub Actions workflow (.github/workflows/bot.yml) runs
+# the engine in a fresh, disposable container on every scheduled run - if
+# these files aren't committed back to the repo, the bot loses all memory of
+# open positions, cooldowns, and history between every single run. They are
+# not secrets (no API keys live in them), so committing them is safe.
