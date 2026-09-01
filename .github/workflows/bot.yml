@@ -38,6 +38,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: DEBUG - show workspace contents
+        run: |
+          echo "Current directory:"
+          pwd
+          echo "Files here:"
+          ls -la
+          echo "Git commit checked out:"
+          git rev-parse HEAD
+          git log -1 --oneline
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
